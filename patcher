@@ -1,65 +1,192 @@
 #!/usr/bin/env sh
 
+verify_name() {
+	if echo "$1" | grep -qE '^[0-9a-zA-Z_]+$'; then
+		return 0
+	else
+		echo "ILLEGAL VARIABLE: Must only contain [0-9a-zA-Z_]" >&2
+		return 1;
+	fi
+}
+verify_addr() {
+	if echo "$1" | grep -qE '^[0-9a-fA-F]+$'; then
+		return 0
+	else
+		echo "ILLEGAL POINTER: Must only contain [0-9a-fA-F]"
+		return 1;
+	fi
+}
 ask_confirm() {
 	echo -n "$1 [y/N] " && read -r action && [ "$action" != "y" ]
 	return $?
 }
 
+#Require variables: PID
 read_wrapper() {
-	# echo "Reading $2 bytes from $1 with offset $3" >&2
-	dd if="/proc/$CLIENT_PID/mem" status=none bs=1 count=$(($2)) skip=$(($1 - ${3:-0}))
+	dd if="/proc/$PID/mem" status=none bs=1 count=$2 skip=$1
+}
+#Require variables: PID
+write_wrapper() {
+	dd of="/proc/$PID/mem" status=none bs=1 count=$2 seek=$1 conv=notrunc
 }
 
-write_wrapper() {
-	# echo "Writing $3 bytes to $2 with offset $4" >&2
-	echo -n "$1" | dd of="/proc/$CLIENT_PID/mem" status=none bs=1 count=$(($3)) seek=$(($2 - ${4:-0})) conv=notrunc
+#Require variables: ORDER, DATA?
+value_order() {
+	case $ORDER in
+		s|string)          echo "$(cat)" ;;
+		s16|string16)      echo "$(iconv -f UTF16LE -t UTF8)" ;;
+		s16r|string16rev)  echo "$(iconv -f UTF16BE -t UTF8)" ;;
+		b|binary)          echo "$(xxd)" ;;
+		i|int)             echo "$(rev | xxd -p | awk '{printf "%d", "0x" $0}')" ;;
+		ir|intrev)         echo "$(xxd -p | awk '{printf "%d", "0x" $0}')" ;;
+		f|file)            cat >>"$DATA" ;;
+		*) echo "ILLEGAL ORDER: Order $ORDER not recognised" >&2 ;;
+	esac
+}
+#Require variables: ORDER, DATA
+value_deorder() {
+	case $ORDER in
+		s|string)          printf "%s" "$DATA" ;;
+		s16|string16)      printf "%s" "$DATA" | iconv -t UTF16LE ;;
+		s16r|string16rev)  printf "%s" "$DATA" | iconv -t UTF16BE ;;
+		b|binary)          printf "%s" "$DATA" | xxd -p -r ;;
+		i|int)             printf "%X" "$DATA" | xxd -p -r | rev;;
+		ir|intrev)         printf "%X" "$DATA" | xxd -p -r ;;
+		f|file)            cat <"$DATA" ;;
+		*) echo "ILLEGAL ORDER: Order $ORDER not recognised" >&2 ;;
+	esac
+}
+#Require variables: ORDER, SIZE
+value_resize() {
+	case $ORDER in
+		s16*|string16*) echo "$((SIZE * 2))" ;;
+		b|binary)       echo "$((SIZE / 2))" ;;
+		*)              echo "$((SIZE))" ;;
+	esac
+}
+
+#Require variables: ORDER, PID, ADDR, SIZE, DATA?, OFFSET?
+read_pretty() {
+	[ -z "$ADDR" ] && return
+	read_wrapper "$((0x$ADDR + ${OFFSET:-0}))" "$(value_resize)" | value_order
+}
+#Require variables: ORDER, PID, ADDR, SIZE, DATA, OFFSET? 
+write_pretty() {
+	[ -z "$ADDR" ] && return
+	value_deorder | write_wrapper "$((0x$ADDR + ${OFFSET:-0}))" "$(value_resize)"
 }
 
 show_usage() {
 	echo "Usage: $0 <pid>";
 	exit 1
 }
-
-set_value() {
-	if echo "$1" | grep -qE '^[a-zA-Z_0-9]+$'; then
-		eval "com_$1=$2"
-	else
-		echo "ILLEGAL VARIABLE: Must only contain [a-zA-Z_0-9]" >&2
-	fi
+show_docs() {
+	echo "$0: General syntax: <cmd>[-order] <var> [data...]"
+  echo "Commands:"
+	echo "  h|help"
+  echo "    Display this"
+	echo "  t|threads <count>"
+  echo "    Set the amount of threads"
+	echo "  a|attach <pid>"
+  echo "    Set the global PID to a new value"
+	echo "  m|maps [flags...]"
+  echo "    Display memory maps in the global PID"
+	echo "  f|find <var> <data> [flags...]"
+  echo "    Search for data in the global PID"
+	echo "  p|point <var> <addr>"
+  echo "    Manually store address to a variable. Its PID is reset to global"
+	echo "  v|view <var>"
+  echo "    View the address/PID stored in a variable"
+	echo "  l|loop <var> <size> <data> [interval]  Set data to a pointer on loop in background"
+	echo "  s|set <var> <size> <data> [offset]"
+  echo "    Set data to a pointer"
+	echo "  g|get <var> <size> [data] [offset]"
+  echo "    Get data from a pointer"
+	echo "Orders:"
+	echo "  -s|-string        The data is sent-as-is string"
+	echo "  -s16|-string16    The target is a UTF16LE string"
+	echo "  -s16r|-string16r  The target is a UTF16BE string"
+	echo "  -b|-binary        The data is hexadecimal string"
+	echo "  -i|-int           The target is an LE integer"
+	echo "  -ir|-intrev       The target is an BE integer"
+	echo "  -f|-file          The data is taken from a file"
+	echo "Flags:"
+	echo "  m-<mode>   Only display maps with specific access (eg. 'm-rw-p', 'm-r--p', 'm---xs')"
+	echo "  n-<name>   Only display maps with specific name (eg. 'n-[heap]', 'n-', 'n-/lib/somelib.so')"
+	echo "  s-<size>   Skip maps larged than <size> (eg. 's-0x12345678', 's-1234')"
+	echo "  sa-<size>  Ask if processing maps larger than <size>"
+	echo "Notes:"
+	echo "  'data' in 'get' is required, if '-file' order is used"
+	echo "  'addr' is provided without '0x'"
+	echo "  'var' can contain [0-9a-zA-z_]"
+	echo "  'size' means 'size in input bytes', or if integer order is used, the size of integer"
 }
 
-get_value() {
-	if echo "$1" | grep -qE '^[a-zA-Z_0-9]+$'; then
-		eval "echo \$com_$1"
-	else
-		echo "ILLEGAL VARIABLE: Must only contain [a-zA-Z_0-9]" >&2
+#All require variables: VAR
+save_list() {
+	if verify_name "$VAR"; then
+		local i=0
+		for addr in $@; do
+			if verify_addr "$addr"; then
+				eval "com_${VAR}_${i}_addr=$addr; com_${VAR}_${i}_pid=$GLOBAL_PID"
+			fi
+			i=$((i + 1))
+		done
+		if [ $i -ne 0 ]; then
+			eval "com_${VAR}_size=$i"
+		fi
 	fi
+}
+purge_list() {
+	if verify_name "$VAR"; then
+		eval "local size=\$com_${VAR}_size"
+		for i in $(seq 0 $size ); do
+			unset "com_${VAR}_${i}_addr" "com_${VAR}_${i}_pid"
+		done
+	fi
+}
+save_state() {
+	if verify_name "$VAR" && verify_addr "$1"; then
+		eval "com_${VAR}_addr=$1; com_${VAR}_pid=$GLOBAL_PID"
+	fi
+}
+purge_state() {
+	if verify_name "$VAR"; then
+		unset "com_${VAR}_addr" "com_${VAR}_pid"
+	fi
+}
+load_state() {
+	if verify_name "$VAR"; then
+		eval "ADDR=\$com_${VAR}_addr"
+		eval "PID=\$com_${VAR}_pid"
+		[ -z "$ADDR" ] && echo "ILLEGAL VARIABLE: Name not found"
+	else
+		ADDR=""; PID="$GLOBAL_PID"
+	fi
+	OFFSET=0
 }
 
 [ $# -ne 1 ] && show_usage
-export CLIENT_PID="$1"
+export THREADS=1 #TODO
+export GLOBAL_PID="$1"
+export CMD="" ORDER=""
+export VAR="" DATA="" SIZE=""
+export PID="" ADDR="" OFFSET="0"
 
 trap 'exit' TERM INT
 
 echo -n "PATCH> "
-while read cmd var data data2; do
-	case $cmd in
-		h|help)
-			#TODO
-			;;
-		a|attach)
-			CLIENT_PID="$var"
-			;;
+while read raw_cmd VAR data1 data2 data3 data4; do
+	CMD="$(echo "$raw_cmd" | cut -d- -f1)"
+	ORDER="$(echo "$raw_cmd" | cut -s -d- -f2)"
+	ORDER="${ORDER:-s}"
+	case $CMD in
+		h|help) show_docs ;;
+		t|threads) THREADS="$((VAR))" ;;
+		a|attach) GLOBAL_PID="${VAR:-$GLOBAL_PID}" ;;
 		m|maps)
-			while read -r e_addr e_mode e_ign e_ign e_ign e_name; do
-				e_size="$(( 0x$(echo "$e_addr" | cut -d- -f2) - 0x$(echo "$e_addr" | cut -d- -f1) ))"
-				e_addr="$(echo "$e_addr" | cut -d- -f1 | tr '[a-z]' '[A-Z]')"
-				echo "Address $e_addr; Size $(printf "%08x" $e_size); Mode $e_mode; Name $e_name"
-			done <"/proc/$CLIENT_PID/maps"
-			;;
-		f|find)
-			v_mode=""; v_name=""; v_cons="";
-			for opt in "$data" "$data2"; do
+			v_mode=""; v_name="";
+			for opt in "$VAR" "$data1"; do
 				case $opt in
 					m-*) v_mode="$(echo "$opt" | cut -d- -f2-)" ;;
 					n-*) v_name="$(echo "$opt" | cut -d- -f2-)" ;;
@@ -71,73 +198,109 @@ while read cmd var data data2; do
 				[ -n "$v_name" -a "$v_name" != "$e_name" ] && continue
 				[ -n "$v_mode" -a "$v_mode" != "$e_mode" ] && continue
 				echo "Address $e_addr; Size $(printf "%08x" $e_size); Mode $e_mode; Name $e_name"
-				[ "$e_size" -gt "$((0xFFFFFF))" ] && ask_confirm "Long segment found. Do you still want to analyze?" <&3 && continue
+			done <"/proc/$GLOBAL_PID/maps"
+			;;
+		f|find)
+			PID="$GLOBAL_PID"
+			OFFSET=0
+			if [ -z "$data1" ]; then
+				echo "ILLEGAL SYNTAX: Must have valid DATA field"
+			else
+				v_cand=""; v_mode=""; v_name=""; v_size="$((0xFFFFFF))"; v_ask=1
+				for opt in "$data2" "$data3" "$data4"; do
+					case $opt in
+						m-*) v_mode="$(echo "$opt" | cut -d- -f2-)" ;;
+						n-*) v_name="$(echo "$opt" | cut -d- -f2-)" ;;
+						s-*) v_size="$(($(echo "$opt" | cut -d- -f2-)))"; v_ask=0 ;;
+						sa-*) v_size="$(($(echo "$opt" | cut -d- -f2-)))" ;;
+					esac
+				done
+				while read -r e_addr e_mode e_ign e_ign e_ign e_name; do
+					e_size="$(( 0x$(echo "$e_addr" | cut -d- -f2) - 0x$(echo "$e_addr" | cut -d- -f1) ))"
+					e_addr="$(echo "$e_addr" | cut -d- -f1 | tr '[a-z]' '[A-Z]')"
+					[ -n "$v_name" -a "$v_name" != "$e_name" ] && continue
+					[ -n "$v_mode" -a "$v_mode" != "$e_mode" ] && continue
+					echo "Address $e_addr; Size $(printf "%08x" $e_size); Mode $e_mode; Name $e_name"
+					[ "$e_size" -gt "$v_size" ] && { [ "$v_ask" -eq 0 ] && continue || ask_confirm "Long segment found. Do you still want to analyze?" <&3 && continue; }
 
-				v_cons="${v_cons}$(read_wrapper "0x$e_addr" "$e_size" | grep -abo "$var" | awk -v addr=$e_addr 'BEGIN{FS=":"; print "ibase=16; obase=10;"} { printf "%s+%X\n", addr, $1 }' | bc | tr '\n' ' ')"
-			done 3<&0 <"/proc/$CLIENT_PID/maps"
-			while true; do
-				echo "Have $(echo "$v_cons" | wc -w) candidates: $v_cons"
-				echo -n "Enter a value for direct pinpoint, or empty to abort: "
-				if ! read -r vat || [ ! -n "$vat" ]; then break; fi
-				v_new_cons=""
-				for v_con in $v_cons; do
-					v_con="$(echo "$v_con" | tr -d '\n ')"
-					if read_wrapper "0x$v_con" "${#var}" | grep -q "$var"; then
-						v_new_cons="${v_new_cons}$v_con "
-					fi
+					v_cand="${v_cand}$(read_wrapper $((0x$e_addr)) "$e_size" | grep -abo "$(value)" | awk -v addr=$e_addr 'BEGIN{FS=":"; print "ibase=16; obase=10;"} { printf "%s+%X\n", addr, $1 }' | bc | tr '\n' ' ')"
+				done 3<&0 <"/proc/$GLOBAL_PID/maps"
+				while true; do
+					echo "Have $(echo "$v_cand" | wc -w) candidates: $v_cand"
+					echo -n "Enter a size and value for a direct pinpoint, or empty to abort: "
+					if ! read SIZE DATA || [ ! -n "$DATA" ]; then break; fi
+					v_new_cand=""
+					for ADDR in $v_cand; do
+						ADDR="$(echo "$ADDR" | tr -d '\n ')"
+						if read_pretty | grep -q "$DATA"; then
+							v_new_cand="${v_new_cand}$ADDR "
+						fi
+					done
+					v_cand=$v_new_cand
 				done
-				v_cons=$v_new_cons
-			done
-			echo "Have $(echo "$v_cons" | wc -w) candidates: $v_cons"
-			echo -n "Enter a value for reverse pinpoint, or empty to abort: "
-			if read -r var && [ -n "$var" ]; then
-				for v_con in $v_cons; do
-						v_con="$(echo "$v_con" | tr -d '\n ')"
-						read_wrapper "0x$v_con" "${#var}" | xxd
+				echo "Have $(echo "$v_cand" | wc -w) candidates: $v_cand"
+				echo -n "Enter a size and value for reverse pinpoint, or empty to abort: "
+				if read SIZE DATA && [ -n "$DATA" ]; then
+					for ADDR in $v_cand; do
+						ADDR="$(echo "$ADDR" | tr -d '\n ')"
+						read_pretty
 						ask_confirm "Should pinpoint?" && continue
-						write_wrapper "$var" "0x$v_con" "${#var}"
-						read_wrapper "0x$v_con" "${#var}" | xxd
+						write_pretty
+						read_pretty
 						ask_confirm "Was pinpoint successful?" && continue
-						v_cons="$v_con"
+						v_cand="$ADDR"
 						break;
-				done
+					done
+				fi
+				echo "Saved $(echo "$v_cand" | wc -w) candidates: $v_cand into '$VAR'"
+				save_list "$v_cand"
 			fi
-			echo "Have $(echo "$v_cons" | wc -w) candidates: $v_cons"
 			;;
 		l|loop)
 
 			;;
-		p|point)
-			if ! echo "$data" | grep -qE '^[0-9a-fA-F]+$'; then
-				echo "ILLEGAL POINTER: Must only contain [0-9a-fA-F]"
-				echo -n "PATCH> "
-				continue;
+		p|point) save_state "$data1" ;;
+		v|view)
+			load_state
+			if [ -n "$ADDR" ]; then
+				echo "State contents: PID: $PID, ADDR: $ADDR"
+			else
+				echo "State contents: not stored"
 			fi
-			set_value "$var" "$data"
 			;;
 		s|set)
-			ptr="$(get_value "$var")"
-			if [ -z "$data" ]; then
-				echo "ILLEGAL SYNTAX: Must have a DATA value"
-				echo -n "PATCH> "
-				continue;
+			load_state
+			SIZE="$data1"
+			DATA="$data2"
+			OFFSET="${data3:-0}"
+			if [ -n "$data2" ]; then
+				write_pretty
+			else
+				echo "ILLEGAL SYNTAX: Must have valid SIZE and DATA fields"
 			fi
-			[ -z "$ptr" ] && echo -n "PATCH> " && continue;
-			write_wrapper "$data" "0x$ptr" "${#data}" "$data2"
 			;;
 		g|get)
-			ptr="$(get_value "$var")"
-			if [ -z "$data" ]; then
-				echo "ILLEGAL SYNTAX: Must have a SIZE value"
-				echo -n "PATCH> "
-				continue;
+			load_state
+			SIZE="$data1"
+			if [ "$ORDER" = "f" -o "$ORDER" = "file" ]; then
+				DATA="$data2"
+				OFFSET="${data3:-0}"
+				if [ -n "$data2" ]; then
+					read_pretty
+				else
+					echo "ILLEGAL SYNTAX: Must have valid SIZE and DATA fields"
+				fi
+			else
+				OFFSET="${data2:-0}"
+				if [ -n "$data1" ]; then
+					read_pretty
+				else
+					echo "ILLEGAL SYNTAX: Must have valid SIZE field"
+				fi
 			fi
-			[ -z "$ptr" ] && echo -n "PATCH> " && continue;
-			read_wrapper "0x$ptr" "$data" "$data2" | xxd
-			echo
 			;;
 		*)
-			echo "ILLEGAL COMMAND: $cmd isn't a recognized command"
+			echo "ILLEGAL COMMAND: $cmd isn't a recognised command"
 			;;
 	esac
 	echo -n "PATCH> "
