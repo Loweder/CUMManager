@@ -1,81 +1,40 @@
 #!/usr/bin/env sh
 
+ILL_CMD="ILLEGAL COMMAND: '%s' is not a recognised command\n"
+ILL_SUBCMD="ILLEGAL COMMAND: '%s' command doesn't support '%s' subcommand\n"
+ILL_ARGC="ILLEGAL SYNTAX: '%s' command requires '%d' arguments\n"
+ILL_NAME="ILLEGAL VARIABLE: %s doesn't exist\n"
+ILL_PAT="ILLEGAL %s: Must only contain %s\n"
+ILL_FMT="ILLEGAL SYNTAX: Format '%s' isn't valid\n"
+ALL_SAVE="SUCCESS: Saving state: To %s, PID $PID, %s\n"
+ALL_LOAD="SUCCESS: Loading state: From %s, PID $PID, %s\n"
+ALL_TRIM="SUCCESS: Trimming state: From %s, PID $PID, %s\n"
+ALL_VIEW="SUCCESS: Viewing state: %s, PID $PID, %s\n"
+ALL_DEL="SUCCESS: Deleted state: From %s, PID $PID, %s\n"
+ALL_MAPS="Address %s; Size %08X; Mode '%s'; Name '%s'\n"
+
+error() {
+	printf "$@" >&2
+}
+
 #Validation section
+verify_args() {
+	local name="$1" count="$2"
+	shift 2
+	[ "$#" -lt "$count" ] && error "$ILL_ARGC" "$name" "$count" && return 1
+}
 verify_name() {
-	if echo "$1" | grep -qE '^[0-9a-zA-Z_]+$'; then
-		return 0
-	else
-		echo "ILLEGAL VARIABLE: Must only contain [0-9a-zA-Z_]" >&2
-		return 1;
-	fi
+	! echo "$1" | grep -qE '^[0-9a-zA-Z_]+$' && error "$ILL_PAT" "VARIABLE" "[0-9a-zA-Z_]" && return 1
 }
 verify_addr() {
-	if echo "$1" | grep -qE '^[0-9a-fA-F]+$'; then
-		return 0
-	else
-		echo "ILLEGAL POINTER: Must only contain [0-9a-fA-F]"
-		return 1;
-	fi
+	! echo "$1" | grep -qE '^[0-9a-fA-F]+$' && error "$ILL_PAT" "POINTER" "[0-9a-fA-F]" && return 1
+}
+verify_int() {
+	! echo "$1" | grep -qE '^[0-9]+$' && error "$ILL_PAT" "INTEGER" "[0-9]" && return 1
 }
 ask_confirm() {
 	echo -n "$1 [y/N] " && read -r action && [ "$action" != "y" ]
 	return $?
-}
-
-#Raw data access section
-#Require variables: PID
-read_wrapper() {
-	dd if="/proc/$PID/mem" status=none bs=1 count=$2 skip=$1
-}
-#Require variables: PID
-write_wrapper() {
-	dd of="/proc/$PID/mem" status=none bs=1 count=$2 seek=$1 conv=notrunc
-}
-
-#Pretty data access section
-#Require variables: ORDER, DATA?
-value_order() {
-	case $ORDER in
-		s|string)          echo "$(cat)" ;;
-		s16|string16)      echo "$(iconv -f UTF16LE -t UTF8 2>/dev/null)" ;;
-		s16r|string16rev)  echo "$(iconv -f UTF16BE -t UTF8 2>/dev/null)" ;;
-		b|binary)          echo "$(xxd)" ;;
-		i|int)             echo "$((0x$(xxd -p | fold -b2 | tac | tr -d '\n')))" ;;
-		ir|intrev)         echo "$((0x$(xxd -p)))" ;;
-		f|file)            cat >>"$DATA" ;;
-		*) echo "ILLEGAL ORDER: Order $ORDER not recognised" >&2 ;;
-	esac
-}
-#Require variables: ORDER, DATA
-value_deorder() {
-	case $ORDER in
-		s|string)          printf "%s" "$DATA" ;;
-		s16|string16)      printf "%s" "$DATA" | iconv -f UTF8 -t UTF16LE 2>/dev/null ;;
-		s16r|string16rev)  printf "%s" "$DATA" | iconv -f UTF8 -t UTF16BE 2>/dev/null ;;
-		b|binary)          printf "%s" "$DATA" | xxd -p -r ;;
-		i|int)             printf "%0*X" "$((($(printf "%X" "$DATA" | wc -c) + 1) & ~1))" "$DATA" | fold -b2 | tac | tr -d '\n' | xxd -p -r ;;
-		ir|intrev)         printf "%0*X" "$((($(printf "%X" "$DATA" | wc -c) + 1) & ~1))" "$DATA" | xxd -p -r ;;
-		f|file)            cat <"$DATA" ;;
-		*) echo "ILLEGAL ORDER: Order $ORDER not recognised" >&2 ;;
-	esac
-}
-#Require variables: ORDER, SIZE
-value_resize() { #TODO change
-	case $ORDER in
-		s16*|string16*) echo "$((SIZE * 2))" ;;
-		b|binary)       echo "$((SIZE / 2))" ;;
-		*)              echo "$((SIZE))" ;;
-	esac
-}
-#Require variables: ORDER, PID, ADDR, SIZE, DATA?, OFFSET?
-read_pretty() {
-	[ -z "$ADDR" ] && return
-	read_wrapper "$((0x$ADDR + ${OFFSET:-0}))" "$(value_resize)" | value_order
-}
-#Require variables: ORDER, PID, ADDR, SIZE, DATA, OFFSET? 
-write_pretty() {
-	[ -z "$ADDR" ] && return
-	value_deorder | write_wrapper "$((0x$ADDR + ${OFFSET:-0}))" "$(value_resize)"
 }
 
 #User documentation section
@@ -123,64 +82,107 @@ show_docs() {
 	echo "  'size' means 'size in input bytes', or if integer order is used, the size of integer"
 }
 
-#Variable manipulation section
-#All require variables: VAR
-save_list() {
-	if verify_name "$VAR"; then
-		local i=0
-		for addr in $@; do
-			if verify_addr "$addr"; then
-				eval "com_${VAR}_${i}_addr=$addr; com_${VAR}_${i}_pid=$GLOBAL_PID"
-			fi
-			i=$((i + 1))
-		done
-		if [ $i -ne 0 ]; then
-			eval "com_${VAR}_size=$i"
-			echo "SUCCESS: Saved state: Into array '$VAR', count $i"
-		fi
-	fi
-}
-purge_list() {
-	if verify_name "$VAR"; then
-		eval "local size=\$com_${VAR}_size"
-		for i in $(seq 0 $size ); do
-			unset "com_${VAR}_${i}_addr" "com_${VAR}_${i}_pid"
-		done
-		unset "com_${VAR}_size"
-	fi
-}
-save_state() {
-	if verify_name "$VAR" && verify_addr "$1"; then
-		eval "com_${VAR}_addr=$1; com_${VAR}_pid=$GLOBAL_PID"
-		echo "SUCCESS: Saved state: Into variable '$VAR', address $1, PID $GLOBAL_PID"
-	fi
-}
-purge_state() {
-	if verify_name "$VAR"; then
-		unset "com_${VAR}_addr" "com_${VAR}_pid"
-	fi
-}
-load_state() {
-	if verify_name "$VAR"; then
-		eval "ADDR=\$com_${VAR}_addr"
-		eval "PID=\$com_${VAR}_pid"
-		if [ -z "$ADDR" ]; then
-			echo "ILLEGAL VARIABLE: Name not found"
-		else
-			echo "SUCCESS: Loaded state: From variable '$VAR', address $ADDR, PID $PID"
-		fi
-	else
-		ADDR=""; PID="$GLOBAL_PID"
-	fi
-	OFFSET=0
-}
-
 [ $# -ne 1 ] && show_usage
 export PAGESIZE=$(getconf PAGESIZE)
 export GLOBAL_PID="$1"
-export CMD="" ORDER=""
-export VAR="" DATA="" SIZE=""
-export PID="" ADDR="" OFFSET="0"
+export CMD="" SUBCMD=""
+
+format_encode() {
+	local FORM="$1" TYPE="" DATA=""
+	while [ -n "$FORM" ]; do
+		TYPE="$(echo "$FORM" | cut -c1)"
+		FORM="$(echo "$FORM" | cut -c2-)"
+		SIZE="$(echo "$FORM" | cut -d: -f1)"
+		FORM="$(echo "$FORM" | cut -d: -f2- -s)"
+		case $TYPE in
+			s|w|W) DATA="$(echo "$FORM" | cut -c-$SIZE)" ;;
+			i|I|f) DATA="$(echo "$FORM" | cut -d: -f1)" ;;
+			b) DATA="$(echo "$FORM" | cut -c-$((SIZE * 2)))" ;;
+		esac
+		case $TYPE in
+			s) echo -n "$DATA" ;;
+			w) echo -n "$DATA" | cut -c -$SIZE | iconv -f UTF8 -t UTF16LE 2>/dev/null ;;
+			W) echo -n "$DATA" | cut -c -$SIZE | iconv -f UTF8 -t UTF16BE 2>/dev/null ;;
+			i) printf "%0*X" "$((SIZE * 2))" "$DATA" | fold -b2 | tac | tr -d '\n' | xxd -p -r ;;
+			I) printf "%0*X" "$((SIZE * 2))" "$DATA" | xxd -p -r ;;
+			b) echo -n "$DATA" | xxd -r -p ;;
+			f) if [ -n "$SIZE" ]; then dd if="$DATA" status=none bs="$SIZE" count=1; else cat "$DATA"; fi ;;
+		esac
+		case $TYPE in 
+			s|w|W) FORM="$(echo "$FORM" | cut -c $((SIZE + 2))-)" ;;
+			i|I|b|f) FORM="$(echo "$FORM" | cut -d: -f2- -s)" ;;
+			*) error "$ILL_FMT" "$1"; return ;;
+		esac
+	done
+}
+format_insize() {
+	local FORM="$1" TYPE="" DATA=""
+	local count=0
+	while [ -n "$FORM" ]; do
+		TYPE="$(echo "$FORM" | cut -c1)"
+		FORM="$(echo "$FORM" | cut -c2-)"
+		SIZE="$(echo "$FORM" | cut -d: -f1)"
+		FORM="$(echo "$FORM" | cut -d: -f2- -s)"
+		[ "$TYPE" = "f" ] && DATA="$(echo "$FORM" | cut -d: -f1)"
+		case $TYPE in
+			s|w|W) FORM="$(echo "$FORM" | cut -c "$((SIZE + 2))-")" ;;
+			i|I|b|f) FORM="$(echo "$FORM" | cut -d: -f2- -s)" ;;
+			*) echo "0"; error "$ILL_FMT" "$1"; return ;;
+		esac
+		case $TYPE in 
+			s|i|I|b) count="$((count + SIZE))" ;;
+			w|W) count="$((count + (SIZE * 2)))" ;;
+			f) count="$((count + "${SIZE:-$(stat -c%s $DATA)}"))" ;;
+		esac
+	done
+	echo "$count"
+}
+format_decode() {
+	local FORM="$1" TYPE=""
+	while [ -n "$FORM" ]; do
+		TYPE="$(echo "$FORM" | cut -c1)"
+		FORM="$(echo "$FORM" | cut -c2-)"
+		SIZE="$(echo "$FORM" | cut -d: -f1)"
+		case $TYPE in 
+			w|W) SIZE="$((SIZE * 2))" ;;
+		esac
+		dd status=none bs=1 count="$SIZE" | {
+			case $TYPE in
+				s) echo "$(cat)" ;;
+				w) echo "$(iconv -f UTF16LE -t UTF8 2>/dev/null)" ;;
+				W) echo "$(iconv -f UTF16BE -t UTF8 2>/dev/null)" ;;
+				i) echo "$((0x$(xxd -p | fold -b2 | tac | tr -d '\n')))" ;;
+				I) echo "$((0x$(xxd -p)))" ;;
+				b) echo "$(xxd)" ;;
+				f) echo "$(cat >> "$(echo "$FORM" | cut -d: -f2 -s)")" ;;
+			esac
+		}
+		case $TYPE in
+			s|w|W|i|I|b) FORM="$(echo "$FORM" | cut -d: -f2- -s)" ;;
+			f) FORM="$(echo "$FORM" | cut -d: -f3- -s)" ;;
+			*) error "$ILL_FMT" "$1"; return ;;
+		esac
+	done
+}
+format_outsize() {
+	local FORM="$1" TYPE=""
+	local count=0
+	while [ -n "$FORM" ]; do
+		TYPE="$(echo "$FORM" | cut -c1)"
+		FORM="$(echo "$FORM" | cut -c2-)"
+		SIZE="$(echo "$FORM" | cut -d: -f1)"
+		case $TYPE in
+			s|w|W|i|I|b) FORM="$(echo "$FORM" | cut -d: -f2- -s)" ;;
+			f) FORM="$(echo "$FORM" | cut -d: -f3- -s)" ;;
+			*) echo "0"; error "$ILL_FMT" "$1"; return ;;
+		esac
+		case $TYPE in 
+			s|i|I|b|f) count="$((count + SIZE))" ;;
+			w|W) count="$((count + (SIZE * 2)))" ;;
+		esac
+	done
+	echo "$count"
+}
 
 trap 'exit' TERM INT
 
@@ -190,144 +192,375 @@ while read raw_cmd VAR data1 data2 data3 data4; do
 	ORDER="$(echo "$raw_cmd" | cut -s -d- -f2)"
 	ORDER="${ORDER:-s}"
 	case $CMD in
-		h|help) show_docs ;;
-		a|attach) GLOBAL_PID="${VAR:-$GLOBAL_PID}" ;;
-		m|maps)
-			v_mode=""; v_name=""; v_size=""
-			for opt in "$VAR" "$data1" "$data2"; do
-				case $opt in
-					m-*) v_mode="$(echo "$opt" | cut -d- -f2-)" ;;
-					n-*) v_name="$(echo "$opt" | cut -d- -f2-)" ;;
-					s-*) v_size="$(echo "$opt" | cut -d- -f2-)" ;;
-				esac
-			done
-			while read -r e_addr e_mode e_ign e_ign e_ign e_name; do
-				e_size="$(( 0x$(echo "$e_addr" | cut -d- -f2) - 0x$(echo "$e_addr" | cut -d- -f1) ))"
-				e_addr="$(echo "$e_addr" | cut -d- -f1 | tr '[a-z]' '[A-Z]')"
-				[ -n "$v_name" -a "$v_name" != "$e_name" ] && continue
-				[ -n "$v_mode" -a "$v_mode" != "$e_mode" ] && continue
-				[ -n "$v_size" -a "$((v_size))" -lt "$e_size" ] && continue
-				echo "Address $e_addr; Size $(printf "%08x" $e_size); Mode $e_mode; Name $e_name"
-			done <"/proc/$GLOBAL_PID/maps"
-			;;
 		f|find)
-			PID="$GLOBAL_PID"
-			DATA="$data1"
-			OFFSET=0
-			if [ -z "$data1" ]; then
-				echo "ILLEGAL SYNTAX: Must have valid DATA field"
-			else
-				DATA="$(value_deorder | xxd -p -c0)"
-				v_cand=""; v_mode=""; v_name=""; v_size="$((0xFFFFFF))"; v_ask=1
-				for opt in "$data2" "$data3" "$data4"; do
-					case $opt in
-						m-*) v_mode="$(echo "$opt" | cut -d- -f2-)" ;;
-						n-*) v_name="$(echo "$opt" | cut -d- -f2-)" ;;
-						s-*) v_size="$(($(echo "$opt" | cut -d- -f2-)))"; v_ask=0 ;;
-						sa-*) v_size="$(($(echo "$opt" | cut -d- -f2-)))" ;;
-					esac
+			while true; do
+				echo "Have $(echo "$v_cand" | wc -w) candidates: $v_cand"
+				echo -n "Enter a size and value for a direct pinpoint, or empty to abort: "
+				read SIZE DATA && [ -n "$DATA" ] || break
+				v_new_cand=""
+				for ADDR in $v_cand; do
+					ADDR="$(echo "$ADDR" | tr -d '\n ')"
+					if read_pretty | grep -F -q "$DATA"; then
+						v_new_cand="${v_new_cand}$ADDR "
+					fi
 				done
-				while read -r e_addr e_mode e_ign e_ign e_ign e_name; do
-					e_size="$(( 0x$(echo "$e_addr" | cut -d- -f2) - 0x$(echo "$e_addr" | cut -d- -f1) ))"
-					e_addr="$(echo "$e_addr" | cut -d- -f1 | tr '[a-z]' '[A-Z]')"
-					[ -n "$v_name" -a "$v_name" != "$e_name" ] && continue
-					[ -n "$v_mode" -a "$v_mode" != "$e_mode" ] && continue
-					[ "$e_size" -gt "$v_size" ] && [ "$v_ask" -eq 0 ] && continue
-					echo "Address $e_addr; Size $(printf "%08X" $e_size); Mode $e_mode; Name $e_name"
-					[ "$e_size" -gt "$v_size" ] && ask_confirm "Long segment found. Do you still want to analyze?" <&3 && continue
-
-					v_cand="${v_cand}$(dd if="/proc/$PID/pagemap" status=none bs=8 count=$((e_size / PAGESIZE)) skip=$((0x$e_addr / PAGESIZE)) | xxd -p -c8 -s7 | cut -c1 | {
-						i_start=0; i_count=0;
-						while read -r i_flag; do
-							if [ "$((0x$i_flag))" -lt 8 ]; then
-								if [ "$i_count" -gt 0 ]; then
-							dd if="/proc/$PID/mem" status=none bs="$PAGESIZE" skip="$(( (0x$e_addr / PAGESIZE) + i_start ))" count="$i_count" | xxd -p -c0 | grep -F -abo "$DATA" | awk -v addr="$((0x$e_addr + ( PAGESIZE * i_start ) ))" 'BEGIN{FS=":"; print "obase=16;"} { printf "%s+(%s/2)\n", addr, $1 }' | bc | tr '\n' ' '
-								fi
-								i_start="$((i_start + i_count + 1))"
-								i_count=0
-							else
-								i_count="$((i_count + 1))"
-							fi
-						done
-						if [ "$i_count" -gt 0 ]; then
-							dd if="/proc/$PID/mem" status=none bs="$PAGESIZE" skip="$(( (0x$e_addr / PAGESIZE) + i_start ))" count="$i_count" | xxd -p -c0 | grep -F -abo "$DATA" | awk -v addr="$((0x$e_addr + ( PAGESIZE * i_start ) ))" 'BEGIN{FS=":"; print "obase=16;"} { printf "%s+(%s/2)\n", addr, $1 }' | bc | tr '\n' ' '
-						fi
-					}) "
-				done 3<&0 <"/proc/$PID/maps"
-				while true; do
-					echo "Have $(echo "$v_cand" | wc -w) candidates: $v_cand"
-					echo -n "Enter a size and value for a direct pinpoint, or empty to abort: "
-					read SIZE DATA && [ -n "$DATA" ] || break
-					v_new_cand=""
+				v_cand=$v_new_cand
+			done
+			echo "Have $(echo "$v_cand" | wc -w) candidates: $v_cand"
+			echo -n "Enter a size and value for reverse pinpoint, empty to abort, or a command (a/o/s): "
+			if read SIZE DATA && [ -n "$SIZE" ]; then
+				v_new_cand=""
+				l_order=""
+				if [ -z "$DATA" ]; then
+					echo -n "Following command '$SIZE', now enter a size and value: " #TODO check command validity
+					l_order="$SIZE"
+					read SIZE DATA
+				fi
+				if [ -n "$DATA" ]; then
 					for ADDR in $v_cand; do
 						ADDR="$(echo "$ADDR" | tr -d '\n ')"
-						if read_pretty | grep -F -q "$DATA"; then
-							v_new_cand="${v_new_cand}$ADDR "
+						if [ "$l_order" = "o" -o "$l_order" = "s" ]; then
+							read_pretty | grep -F -q "$DATA" || continue
 						fi
+						if [ "$l_order" != "a" -a "$l_order" != "o" ]; then
+							read_pretty
+							ask_confirm "Should pinpoint?" && continue
+						fi
+						write_pretty
+						if [ "$l_order" != "a" -a "$l_order" != "o" ]; then
+							read_pretty
+							ask_confirm "Was pinpoint successful?" && continue
+						fi
+						v_new_cand="${v_new_cand}$ADDR "
+						[ -z "$l_order" -o "$l_order" = "s" ] && break;
 					done
-					v_cand=$v_new_cand
-				done
-				echo "Have $(echo "$v_cand" | wc -w) candidates: $v_cand"
-				echo -n "Enter a size and value for reverse pinpoint, empty to abort, or a command (a/o/s): "
-				if read SIZE DATA && [ -n "$SIZE" ]; then
-					v_new_cand=""
-					l_order=""
-					if [ -z "$DATA" ]; then
-						echo -n "Following command '$SIZE', now enter a size and value: " #TODO check command validity
-						l_order="$SIZE"
-						read SIZE DATA
-					fi
-					if [ -n "$DATA" ]; then
-						for ADDR in $v_cand; do
-							ADDR="$(echo "$ADDR" | tr -d '\n ')"
-							if [ "$l_order" = "o" -o "$l_order" = "s" ]; then
-								read_pretty | grep -F -q "$DATA" || continue
-							fi
-							if [ "$l_order" != "a" -a "$l_order" != "o" ]; then
-								read_pretty
-								ask_confirm "Should pinpoint?" && continue
-							fi
-							write_pretty
-							if [ "$l_order" != "a" -a "$l_order" != "o" ]; then
-								read_pretty
-								ask_confirm "Was pinpoint successful?" && continue
-							fi
-							v_new_cand="${v_new_cand}$ADDR "
-							[ -z "$l_order" -o "$l_order" = "s" ] && break;
-						done
-					fi
-					v_cand=$v_new_cand
 				fi
-				save_list "$v_cand"
+				v_cand=$v_new_cand
 			fi
+			save_list "$v_cand"
 			;;
-		l|loop)
+	esac
+	echo -n "PATCH> "
+done
 
+attach_maps() {
+	PID="$1"
+	if [ "$#" -gt "0" ]; then
+		verify_int "$PID" && GLOBAL_PID="$PID"
+	else
+		echo "Current PID: $GLOBAL_PID"
+	fi
+}
+
+show_maps() {
+	local v_mode="" v_name="" v_size=""
+	for opt in $@; do
+		case $opt in
+			m-*) v_mode="$(echo "$opt" | cut -d- -f2-)" ;;
+			n-*) v_name="$(echo "$opt" | cut -d- -f2-)" ;;
+			s-*) v_size="$(( $(echo "$opt" | cut -d- -f2-) ))" ;;
+		esac
+	done
+	while read -r e_raw_addr e_mode e_ign e_ign e_ign e_name; do
+		e_addr="0x$(echo "$e_raw_addr" | cut -d- -f1 | tr '[a-z]' '[A-Z]')"
+		e_size="$(( 0x$(echo "$e_raw_addr" | cut -d- -f2) - 0x$(echo "$e_raw_addr" | cut -d- -f1) ))"
+		[ -n "$v_name" -a "$v_name" != "$e_name" ] && continue
+		[ -n "$v_mode" -a "$v_mode" != "$e_mode" ] && continue
+		[ -n "$v_size" -a "$v_size" -lt "$e_size" ] && continue
+		printf "$ALL_MAPS" "$e_addr" "$e_size" "$e_mode" "$e_name"
+	done <"/proc/$GLOBAL_PID/maps"
+}
+find_maps() {
+	VAR="$1" PID=$GLOBAL_PID DATA="$(format_encode "$2" | od -An -tx1 | tr -d ' \n')"
+	local v_cand="" v_mode="" v_name="" v_size="$((0xFFFFFF))" v_ask=1
+	verify_args "find maps" "2" || return
+
+	for opt in $@; do
+		case $opt in
+			m-*) v_mode="$(echo "$opt" | cut -d- -f2-)" ;;
+			n-*) v_name="$(echo "$opt" | cut -d- -f2-)" ;;
+			s-*) v_size="$(( $(echo "$opt" | cut -d- -f2-) ))"; v_ask=0 ;;
+			sa-*) v_size="$(( $(echo "$opt" | cut -d- -f2-) ))" ;;
+		esac
+	done
+
+	while read -r e_raw_addr e_mode e_ign e_ign e_ign e_name; do
+		e_addr="0x$(echo "$e_raw_addr" | cut -d- -f1 | tr '[a-z]' '[A-Z]')"
+		e_size="$(( 0x$(echo "$e_raw_addr" | cut -d- -f2) - 0x$(echo "$e_raw_addr" | cut -d- -f1) ))"
+		[ -n "$v_name" -a "$v_name" != "$e_name" ] && continue
+		[ -n "$v_mode" -a "$v_mode" != "$e_mode" ] && continue
+		[ "$e_size" -gt "$v_size" ] && [ "$v_ask" -eq 0 ] && continue
+		printf "$ALL_MAPS" "$e_addr" "$e_size" "$e_mode" "$e_name"
+		[ "$e_size" -gt "$v_size" ] && ask_confirm "Long segment found. Do you still want to analyze?" <&3 && continue
+		v_cand="${v_cand}$(dd status=none bs=8 skip=$((e_addr / PAGESIZE)) count=$((e_size / PAGESIZE)) if="/proc/$PID/pagemap" | 
+			xxd -p -c8 -s7 | cut -c1 | {
+			i_start=0; i_count=0;
+			while read -r i_flag || [ "$i_count" -gt "0" ]; do
+				if [ -z "$i_flag" -o "$((0x$i_flag))" -lt 8 ]; then
+					[ "$i_count" -gt 0 ] && dd status=none bs="$PAGESIZE" skip="$(((e_addr / PAGESIZE) + i_start))" count="$i_count" if="/proc/$PID/mem" |
+						od -An -tx1 | tr -d ' \n' | grep -F -abo "$DATA" | 
+						awk -v addr="$((e_addr + ( PAGESIZE * i_start ) ))" 'BEGIN{FS=":"; print "obase=16;"} { printf "%s+(%s/2)\n", addr, $1 }' | 
+						bc | tr '\n' ' '
+					i_start="$((i_start + i_count + 1))"
+					i_count=0
+				else
+					i_count="$((i_count + 1))"
+				fi
+			done
+		})"
+	done 3<&0 <"/proc/$PID/maps"
+	if [ "$(echo "$v_cand" | wc -w)" -gt "1" ]; then
+		create_array "$VAR" $v_cand
+		trim_array "$VAR"
+	elif [ -n "$v_cand" ]; then
+		create_scalar "$VAR" "$v_cand"
+	else
+		#TODO
+		echo "Found no results"
+	fi
+}
+trim_array() {
+	VAR="$1" PID=$GLOBAL_PID DATA=""
+	verify_args "trim array" "1" || return
+
+	if verify_name "$VAR"; then
+		while true; do
+			eval "local size=\$com_${VAR}_size"
+			[ -z "$size" ] && error "$ILL_NAME" "Array '$VAR'" && return
+
+			printf "$ALL_TRIM" "array '$VAR'" "size: '$size'"
+			echo -n "Enter a value for a trimming operation, or empty to abort: "
+			read -r DATA && [ -n "$DATA" ] || break
+			for i in $(seq 0 $size ); do
+				eval "ADDR=\$com_${VAR}_addr PID=\$com_${VAR}_pid"
+				[ -z "$ADDR" ] && continue
+				case $SUBCMD in #TODO
+					""|m)
+
+						;;
+					s)
+
+						;;
+					o)
+
+						;;
+					f)
+
+						;;
+				esac
+			done
+			case $SUBCMD in
+				f) ;;
+				*) break ;;
+			esac
+		done
+	fi
+}
+
+create_scalar() {
+	VAR="$1" PID=$GLOBAL_PID ADDR="$2"
+	verify_args "create scalar" "2" || return
+
+	if verify_name "$VAR" && verify_addr "$ADDR"; then
+		eval "com_${VAR}_addr=$ADDR; com_${VAR}_pid=$PID"
+		printf "$ALL_SAVE" "variable '$VAR'" "address: '$ADDR'"
+	fi
+}
+create_array() {
+	VAR="$1" PID=$GLOBAL_PID
+	verify_args "create array" "1" || return
+
+	if verify_name "$VAR"; then
+		local i=0
+		for addr in $@; do
+			if verify_addr "$addr"; then
+				eval "com_${VAR}_${i}_addr=$ADDR; com_${VAR}_${i}_pid=$PID"
+				i=$((i + 1))
+			fi
+		done
+		if [ "$i" -gt 0 ]; then
+			eval "com_${VAR}_size=$i"
+			printf "$ALL_SAVE" "array '$VAR'" "size: '$i'"
+		else
+			print "$ILL_ARGC" "create array" ">1"
+		fi
+	fi
+}
+
+delete_scalar() {
+	VAR="$1"
+	verify_args "delete scalar" "1" || return
+
+	if verify_name "$VAR"; then
+		eval "ADDR=\$com_${VAR}_addr PID=\$com_${VAR}_pid"
+		[ -z "$ADDR" ] && error "$ILL_NAME" "Variable '$VAR'" && return
+
+		unset "com_${VAR}_addr" "com_${VAR}_pid"
+		printf "$ALL_DEL" "variable '$VAR'" "address: '$ADDR'"
+	fi
+}
+view_scalar() {
+	VAR="$1" PID=$GLOBAL_PID
+	verify_args "view scalar" "1" || return
+
+	if verify_name "$VAR"; then
+		eval "ADDR=\$com_${VAR}_addr PID=\$com_${VAR}_pid"
+		[ -z "$ADDR" ] && error "$ILL_NAME" "Variable '$VAR'" && return
+
+		printf "$ALL_VIEW" "variable '$VAR'" "address: '$ADDR'"
+	fi
+}
+get_scalar() {
+	VAR="$1" DATA="$2" SIZE="$(format_outsize "$2")" OFFSET="${3:-0}"
+	verify_args "get scalar" "2" || return
+
+	if verify_name "$VAR"; then
+		eval "ADDR=\$com_${VAR}_addr PID=\$com_${VAR}_pid"
+		[ -z "$ADDR" ] && error "$ILL_NAME" "Variable '$VAR'" && return
+
+		printf "$ALL_LOAD" "variable '$VAR'" "address: '$ADDR'"
+		dd if="/proc/$PID/mem" status=none bs=1 count="$SIZE" skip="$((ADDR + OFFSET))" | format_decode "$DATA"
+	fi
+}
+set_scalar() {
+	VAR="$1" DATA="$(format_encode "$2" | xxd -p -c0)" SIZE="$(format_insize "$2")" OFFSET="${3:-0}"
+	verify_args "set scalar" "2" || return
+
+	if verify_name "$VAR"; then
+		eval "ADDR=\$com_${VAR}_addr PID=\$com_${VAR}_pid"
+		[ -z "$ADDR" ] && error "$ILL_NAME" "Variable '$VAR'" && return
+
+		printf "$ALL_LOAD" "variable '$VAR'" "address: '$ADDR'"
+		echo "$DATA" | xxd -r -p | dd of="/proc/$PID/mem" status=none bs=1 count="$SIZE" seek="$((ADDR + OFFSET))" conv=notrunc
+	fi
+}
+
+delete_array() {
+	VAR="$1"
+	verify_args "delete array" "1" || return
+
+	if verify_name "$VAR"; then
+		eval "local size=\$com_${VAR}_size"
+		[ -z "$size" ] && error "$ILL_NAME" "Array '$VAR'" && return
+
+		for i in $(seq 0 $size ); do
+			unset "com_${VAR}_${i}_addr" "com_${VAR}_${i}_pid"
+		done
+		unset "com_${VAR}_size"
+		printf "$ALL_DEL" "array '$VAR'" "size: '$size'"
+	fi
+}
+view_array() {
+	VAR="$1" PID=$GLOBAL_PID
+	verify_args "view array" "1" || return
+
+	if verify_name "$VAR"; then
+		eval "local size=\$com_${VAR}_size"
+		[ -z "$size" ] && error "$ILL_NAME" "Array '$VAR'" && return
+
+		if [ "$size" -lt 100 ]; then
+			for i in $(seq 0 $size ); do
+				eval "ADDR=\$com_${VAR}_${i}_addr PID=\$com_${VAR}_${i}_pid"
+				[ -z "$ADDR" ] && continue
+				printf "$ALL_VIEW" "index '$i'" "address: '$ADDR'"
+			done
+		fi
+		printf "$ALL_VIEW" "array '$VAR'" "size: '$size'"
+	fi
+}
+get_array() {
+	VAR="$1" DATA="$2" SIZE="$(format_outsize "$2")" OFFSET="0"
+	verify_args "get array" "2" || return
+
+	if verify_name "$VAR"; then
+		eval "local size=\$com_${VAR}_size"
+		[ -z "$size" ] && error "$ILL_NAME" "Array '$VAR'" && return
+
+		printf "$ALL_LOAD" "array '$VAR'" "size: '$size'"
+		for i in $(seq 0 $size ); do
+			eval "ADDR=\$com_${VAR}_addr PID=\$com_${VAR}_pid"
+			[ -z "$ADDR" ] && continue
+			dd if="/proc/$PID/mem" status=none bs=1 count="$SIZE" skip="$((ADDR + OFFSET))" | format_decode "$DATA"
+		done
+	fi
+}
+set_array() {
+	VAR="$1" DATA="$(format_encode "$2" | xxd -p -c0)" SIZE="$(format_insize "$2")" OFFSET="0"
+	verify_args "set array" "2" || return
+
+	if verify_name "$VAR"; then
+		eval "local size=\$com_${VAR}_size"
+		[ -z "$size" ] && error "$ILL_NAME" "Array '$VAR'" && return
+
+		printf "$ALL_LOAD" "array '$VAR'" "size: '$size'"
+		for i in $(seq 0 $size ); do
+			eval "ADDR=\$com_${VAR}_addr PID=\$com_${VAR}_pid"
+			[ -z "$ADDR" ] && continue
+			echo "$DATA" | xxd -r -p | dd of="/proc/$PID/mem" status=none bs=1 count="$SIZE" seek="$((ADDR + OFFSET))" conv=notrunc
+		done
+	fi
+}
+
+echo "Heya there. WARNING"
+echo "This script does low-level RAM editing in real-time"
+echo "If used improperly, it may crash your system!"
+echo "This script has minimal error handling for"
+echo "optimization and keeping a small codebase reasons"
+echo "If unsure what to do, use the 'h' command or read the source code"
+echo -n "PATCH> "
+while read -r raw_cmd data; do
+	CMD="$(echo "$raw_cmd" | cut -d- -f1)"
+	SUBCMD="$(echo "$raw_cmd" | cut -s -d- -f2)"
+	case $CMD in
+		h|help) show_docs ;;
+		a|attach) attach_maps $data ;;
+		m|maps) show_maps $data ;;
+		f|find) find_maps $data ;;
+		t|trim) 
+			case "$SUBCMD" in
+				""|m|s|o|f) trim_array $data ;;
+				*) error "$ILL_SUBCMD" "$CMD" "$SUBCMD" ;;
+			esac
 			;;
-		p|point) save_state "$data1" ;;
-		v|view) load_state ;;
-		s|set)
-			load_state
-			SIZE="$data1"
-			DATA="$data2"
-			OFFSET="${data3:-0}"
-			[ -n "$data2" ] && write_pretty || echo "ILLEGAL SYNTAX: Must have valid SIZE and DATA fields"
+		c|create)
+			case $SUBCMD in
+				""|s)	create_scalar $data ;;
+				a) create_array $data ;;
+				*) error "$ILL_SUBCMD" "$CMD" "$SUBCMD" ;;
+			esac
+			;;
+		d|delete)
+			case $SUBCMD in
+				""|s)	delete_scalar $data ;;
+				a) delete_array $data ;;
+				*) error "$ILL_SUBCMD" "$CMD" "$SUBCMD" ;;
+			esac
+			;;
+		v|view)
+			case $SUBCMD in
+				""|s)	view_scalar $data ;;
+				a) view_array $data ;;
+				*) error "$ILL_SUBCMD" "$CMD" "$SUBCMD" ;;
+			esac
 			;;
 		g|get)
-			load_state
-			SIZE="$data1"
-			if [ "$ORDER" = "f" -o "$ORDER" = "file" ]; then
-				DATA="$data2"
-				OFFSET="${data3:-0}"
-				[ -n "$data2" ] && read_pretty ||	echo "ILLEGAL SYNTAX: Must have valid SIZE and DATA fields"
-			else
-				OFFSET="${data2:-0}"
-				[ -n "$data1" ] && read_pretty ||	echo "ILLEGAL SYNTAX: Must have valid SIZE field"
-			fi
+			case $SUBCMD in
+				""|s)	get_scalar $data ;;
+				a) get_array $data ;;
+				*) error "$ILL_SUBCMD" "$CMD" "$SUBCMD" ;;
+			esac
 			;;
-		*)
-			echo "ILLEGAL COMMAND: $cmd isn't a recognised command"
+		s|set)
+			case $SUBCMD in
+				""|s)	set_scalar $data ;;
+				a) set_array $data ;;
+				*) error "$ILL_SUBCMD" "$CMD" "$SUBCMD" ;;
+			esac
 			;;
+		l|loop)
+			#TODO
+			;;
+		*) error "$ILL_CMD" "$CMD" ;;
 	esac
 	echo -n "PATCH> "
 done
